@@ -1,8 +1,10 @@
-import requests
-import time
 import os
+import time
 import random
+import threading
+import requests
 from datetime import datetime
+from flask import Flask
 
 # ============================================================
 # CONFIG
@@ -14,11 +16,10 @@ SESSION_COOKIE = os.getenv("AGENTROUTER_SESSION")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Normal check interval = 14 minutes
+# Check approximately every 14 minutes
 CHECK_INTERVAL = 14 * 60
 
-# Small random variation so checks aren't exactly identical
-# every cycle. This is just polite scheduling, not ban evasion.
+# Small scheduling jitter
 JITTER_SECONDS = 30
 
 HEADERS = {
@@ -28,6 +29,22 @@ HEADERS = {
     "new-api-user": "185239",
 }
 
+# ============================================================
+# WEB SERVER FOR UPTIMEROBOT
+# ============================================================
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return "Claude Monitor is running"
+
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
 
 # ============================================================
 # TELEGRAM
@@ -35,10 +52,14 @@ HEADERS = {
 
 def send_telegram(message):
 
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram credentials missing")
+        return False
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     try:
-        r = requests.post(
+        response = requests.post(
             url,
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
@@ -48,7 +69,9 @@ def send_telegram(message):
             timeout=15
         )
 
-        r.raise_for_status()
+        response.raise_for_status()
+
+        print("Telegram notification sent")
         return True
 
     except Exception as e:
@@ -57,12 +80,12 @@ def send_telegram(message):
 
 
 # ============================================================
-# AGENT ROUTER
+# AGENTROUTER
 # ============================================================
 
 def get_models():
 
-    r = requests.get(
+    response = requests.get(
         AGENTROUTER_URL,
         headers=HEADERS,
         cookies={
@@ -71,28 +94,25 @@ def get_models():
         timeout=20
     )
 
-    # Authentication/session expired
-    if r.status_code in (401, 403):
+    if response.status_code in (401, 403):
 
         send_telegram(
-            "⚠️ <b>AgentRouter monitor needs attention</b>\n\n"
-            "The session appears to have expired or authentication "
-            "was rejected.\n\n"
-            "The monitor has stopped making requests."
+            "⚠️ <b>AgentRouter Monitor</b>\n\n"
+            "Session expired or authentication was rejected.\n"
+            "Please update AGENTROUTER_SESSION on Render."
         )
 
         raise RuntimeError(
-            f"Authentication failed: HTTP {r.status_code}"
+            f"Authentication failed: HTTP {response.status_code}"
         )
 
-    # Respect server-side rate limiting
-    if r.status_code == 429:
+    if response.status_code == 429:
 
-        retry_after = r.headers.get("Retry-After")
+        retry_after = response.headers.get("Retry-After")
 
-        if retry_after:
+        try:
             wait = int(retry_after)
-        else:
+        except (TypeError, ValueError):
             wait = 15 * 60
 
         print(
@@ -103,13 +123,13 @@ def get_models():
 
         return None
 
-    r.raise_for_status()
+    response.raise_for_status()
 
-    return r.json()["data"]
+    return response.json()["data"]
 
 
 # ============================================================
-# CLAUDE STATUS
+# HEARTBEAT
 # ============================================================
 
 def latest_heartbeat(model):
@@ -140,108 +160,135 @@ def status_text(status):
 
 
 # ============================================================
-# MAIN
+# MONITOR
 # ============================================================
 
-previous_status = {}
+def monitor():
 
-print("=" * 60)
-print("        AGENT ROUTER CLAUDE MONITOR")
-print("=" * 60)
-print("Polling interval: 14 minutes")
-print()
+    # Keep previous status in memory
+    previous_status = {}
 
+    print("=" * 60)
+    print("       AGENT ROUTER CLAUDE MONITOR")
+    print("=" * 60)
+    print("Polling interval: 14 minutes")
+    print()
 
-while True:
+    while True:
 
-    try:
+        try:
 
-        data = get_models()
+            data = get_models()
 
-        if data is None:
-            continue
-
-        for model in data["models"]:
-
-            name = model["name"]
-
-            # Automatically monitor any Claude model
-            if not name.lower().startswith("claude-"):
+            if data is None:
                 continue
 
-            current = latest_heartbeat(model)
-            previous = previous_status.get(name)
-
             print(
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "|",
-                name,
-                "|",
-                previous,
-                "→",
-                current
+                "\n[" +
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S") +
+                "] Checking models..."
             )
 
-            # ------------------------------------------------
-            # Claude became active again
-            # ------------------------------------------------
+            for model in data.get("models", []):
 
-            if (
-                previous == "none"
-                and current in ("ok", "warn", "degraded")
-            ):
+                name = model.get("name", "")
 
-                message = (
-                    "🚨 <b>Claude model detected!</b>\n\n"
-                    f"Model: <b>{name}</b>\n"
-                    f"Current: {status_text(current)}\n"
-                    f"Heartbeat: <code>{current}</code>\n\n"
-                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                # Automatically detect Claude models
+                if not name.lower().startswith("claude-"):
+                    continue
+
+                current = latest_heartbeat(model)
+                previous = previous_status.get(name)
+
+                print(
+                    f"{name:<25} "
+                    f"{previous} -> {current}"
                 )
 
-                print("\nSending Telegram notification...")
-                send_telegram(message)
+                # ------------------------------------------------
+                # Claude came back
+                # ------------------------------------------------
 
-            previous_status[name] = current
+                if (
+                    previous == "none"
+                    and current in ("ok", "warn", "degraded")
+                ):
 
-    except RuntimeError as e:
+                    message = (
+                        "🚨 <b>Claude model is back!</b>\n\n"
+                        f"Model: <b>{name}</b>\n"
+                        f"Status: <b>{status_text(current)}</b>\n"
+                        f"Heartbeat: <code>{current}</code>\n\n"
+                        f"Time: "
+                        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
 
-        print("STOPPED:", e)
-        break
+                    print("Sending Telegram alert...")
 
-    except requests.RequestException as e:
+                    send_telegram(message)
 
-        # Network error: don't immediately retry repeatedly.
-        print("Network error:", e)
-        print("Backing off before next attempt...")
+                previous_status[name] = current
 
-        time.sleep(60)
+        except RuntimeError as e:
 
-        continue
+            print("STOPPED:", e)
+            break
 
-    except Exception as e:
+        except requests.RequestException as e:
 
-        print("Unexpected error:", e)
+            print("Network error:", e)
+            print("Waiting 60 seconds before retry...")
 
-        # Conservative recovery
-        time.sleep(60)
+            time.sleep(60)
+            continue
 
-        continue
+        except Exception as e:
 
-    # --------------------------------------------------------
-    # Wait approximately 14 minutes before next check
-    # --------------------------------------------------------
+            print("Unexpected error:", e)
+            print("Waiting 60 seconds...")
 
-    jitter = random.randint(
-        -JITTER_SECONDS,
-        JITTER_SECONDS
+            time.sleep(60)
+            continue
+
+        # --------------------------------------------------------
+        # 14-minute interval + small jitter
+        # --------------------------------------------------------
+
+        jitter = random.randint(
+            -JITTER_SECONDS,
+            JITTER_SECONDS
+        )
+
+        wait_time = CHECK_INTERVAL + jitter
+
+        print(
+            f"Next check in approximately "
+            f"{wait_time // 60} minutes."
+        )
+
+        time.sleep(wait_time)
+
+
+# ============================================================
+# START
+# ============================================================
+
+if __name__ == "__main__":
+
+    # Start monitor in background
+    monitor_thread = threading.Thread(
+        target=monitor,
+        daemon=True
     )
 
-    wait_time = CHECK_INTERVAL + jitter
+    monitor_thread.start()
 
-    print(
-        f"\nNext check in approximately "
-        f"{wait_time // 60} minutes."
+    # Render provides PORT automatically
+    port = int(os.environ.get("PORT", 10000))
+
+    print(f"Web server starting on port {port}")
+
+    app.run(
+        host="0.0.0.0",
+        port=port
     )
-
-    time.sleep(wait_time)
